@@ -22,7 +22,7 @@ npx justmd <file.md> --open       # also launch in the default browser
 - Output is a single `.html` file with zero external references (mermaid inlined,
   ~3.5 MB overhead). Send it anywhere — phone, chat attachment, air-gapped machine —
   and it renders identically.
-- Prints the output path on stdout; errors on stderr with non-zero exit.
+- Prints the absolute output path on stdout; errors on stderr with non-zero exit.
 - Reads only the input file; writes only the output file. Safe for untrusted trees.
 
 ## Notes for agents

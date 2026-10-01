@@ -24,8 +24,8 @@ family the big renderers use.
   client JS, no CDN) with a Tokyo Night palette.
 - **GFM tables** with prose-friendly cells (horizontal scroll instead of squeeze).
 - **Mermaid diagrams** render client-side, full-size (`useMaxWidth: false`).
-- **Agent-friendly**: deterministic output path on stdout, no side effects beyond
-  the output file. See [SKILL.md](SKILL.md) for the agent contract.
+- **Agent-friendly**: deterministic absolute output path on stdout, no side
+  effects beyond the output file. See [SKILL.md](SKILL.md) for the agent contract.
 
 ## Desktop integration (Linux)
 
