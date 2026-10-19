@@ -7,7 +7,7 @@ import { ready, parse } from "markdown-wasm";
 import hljs from "highlight.js/lib/common";
 import { createRequire } from "node:module";
 import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
@@ -188,11 +188,15 @@ td code,th code{margin:0}
   a::after{transform:scaleX(1)}
 }
 @media print{
-  body{background:none;color:#000}
+  /* ponytail: blanket light print — every dark-theme color and background
+     is overridden at * level; per-element rules would always miss one. */
+  *,*::before,*::after,::marker{color:#000!important;background:transparent!important;
+    box-shadow:none!important;text-shadow:none!important}
+  html,body{background:#fff!important}
   body::before{display:none}
-  article{border:none;box-shadow:none;background:none;padding:0}
-  header h1,h1,h2,h3,h4,strong{color:#000}
-  a{color:#000}
+  article{border:none;padding:0}
+  td,th{border:1px solid #999!important}
+  a{text-decoration:underline}
 }
 </style>
 <script>__MERMAID__</script>
@@ -257,12 +261,12 @@ const mermaidJs = readFileSync(join(dirname(require_.resolve("mermaid/package.js
   .replace(/<\/script/gi, "<\\/script");
 
 const html = TEMPLATE
-  .replaceAll("__TITLE__", esc(title))
+  .replaceAll("__TITLE__", esc(unesc(title)))
   .replace("__FONTS__", () => FONTS)
   .replace("__MERMAID__", () => mermaidJs)
   .replace("__BODY__", () => txt);
 
-const out = outPath || input.replace(/\.(md|markdown)$/i, "") + ".html";
+const out = resolve(outPath || input.replace(/\.(md|markdown)$/i, "") + ".html"); // absolute: openers treat relative paths as URLs
 writeFileSync(out, html);
 console.log(out);
 

@@ -9,6 +9,12 @@ Use when the user wants to **read or check** a `.md` file where terminal renderi
 falls short: tables with prose cells, mermaid/flowchart blocks, long structured
 documents. Do not use for editing.
 
+**Also the markdown → PDF path for this workspace** (no pandoc/wkhtmltopdf
+installed). When a deliverable must be a PDF — a recipient that rejects `.md`
+attachments, or "convert this markdown to PDF" — render with justmd, then print
+the HTML with headless Chrome. Never hand-author HTML for existing markdown;
+that silently drifts from the source.
+
 ## Usage
 
 ```sh
@@ -16,6 +22,23 @@ npx justmd <file.md>              # write <file>.html, print its path
 npx justmd <file.md> -o out.html  # choose output path
 npx justmd <file.md> --open       # also launch in the default browser
 ```
+
+## Print → PDF
+
+```sh
+npx justmd file.md -o file.html
+/opt/google/chrome/chrome --headless --disable-gpu --no-sandbox \
+  --no-pdf-header-footer --print-to-pdf=file.pdf file.html
+```
+
+`--out` is not a flag — the CLI accepts `-o` only. Output defaults to
+`<input>.html`, so `-o` matters when writing elsewhere.
+
+The `@media print` styles force a light print: all text black, backgrounds
+removed, table borders drawn — so code spans and GFM tables stay legible in the
+PDF. Verify by reading the PDF back (`pdftotext file.pdf - | head`, or rasterize
+with `pdftoppm` and look at it) — extraction proves text, a raster proves
+legibility. Not by file size or page count alone.
 
 ## Contract
 
