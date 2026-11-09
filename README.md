@@ -45,11 +45,23 @@ both. Commented passages stay highlighted, and the list sits in the corner.
 
 ![Review mode: a highlighted passage, the comment form and the comment dock](docs/review.webp)
 
-Every save is written to `<file>.comments.md` next to the input, with the quoted
-passage, its source line, and your comment or replacement text. **Send to AI**
-writes the final list and exits the process, so an agent that started
-`justmd --review` and waits on it gets your comments the moment you press it.
-The written `.html` file never contains the review UI.
+**Send to AI** writes `<file>.comments.md` next to the input (each quoted
+passage with its source line and your comment or replacement text) and ends
+the `justmd --review` command, so an agent waiting on it gets your comments the
+moment you press it. The agent edits the file and runs `--review` again for the
+next round.
+
+The page stays open between rounds and **updates in place** whenever the file
+changes on disk: no reload, no new tab, comments that still match stay
+highlighted. Every change is kept as a version in `.justmd/<file>/`, so the
+version button lists them all; open an old one to read it, and **Restore this
+version** writes it back to the file (as a new version, so a restore can be
+undone too).
+
+![Viewing an older version, with Restore and Back to latest](docs/versions.webp)
+
+The written `.html` file never contains the review UI. The review server binds
+to 127.0.0.1 only and exits a minute after its tab is closed.
 
 ## Desktop integration (Linux)
 
