@@ -15,6 +15,14 @@ npx justmd <file.md> --open       # also open in the default browser
 npx justmd <file.md> --review     # open with select-to-comment, comments go back to file
 ```
 
+## Agent skill
+
+[`SKILL.md`](SKILL.md) ships in this repository and the npm package. It defines
+the `justmd` skill for markdown previews, inline feedback rounds, live updates,
+version restore and PDF preparation. Install it using your agent's skill-loading
+mechanism. Review approval does not grant permission to publish or submit.
+
+
 ## Why
 
 Every existing markdown viewer either needs a vault (Obsidian), renders tables

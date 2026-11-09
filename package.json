@@ -1,6 +1,6 @@
 {
   "name": "justmd",
-  "version": "0.4.0-alpha.0",
+  "version": "0.4.0-alpha.1",
   "description": "Render markdown to a self-contained HTML file — GFM tables, mermaid diagrams, one opinionated theme. npx justmd file.md",
   "license": "MIT",
   "repository": {
