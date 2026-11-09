@@ -8,9 +8,9 @@
 import { ready, parse } from "markdown-wasm";
 import hljs from "highlight.js/lib/common";
 import { createRequire } from "node:module";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
@@ -221,7 +221,7 @@ __BODY__
 const REVIEW_CSS = `
 ::highlight(justmd-comment){background:rgba(233,127,192,.3);color:#fff}
 .jm-add,.jm-pop{position:absolute;z-index:10}
-.jm-add[hidden],.jm-pop[hidden],.jm-list[hidden]{display:none!important}
+.jm-add[hidden],.jm-pop[hidden],.jm-dock [hidden]{display:none!important}
 .jm-add{display:grid;place-items:center;width:2.25rem;height:2.25rem;padding:0;border-radius:50%;border:1px solid var(--border);background:#2A2136;color:var(--link);cursor:pointer;box-shadow:0 .5rem 1.5rem -.5rem rgba(0,0,0,.8)}
 .jm-add:hover{color:#fff;background:var(--magenta)}
 .jm-pop,.jm-dock{background:#221F2E;border:1px solid var(--border);border-radius:.75rem;box-shadow:0 1rem 3rem -1rem rgba(0,0,0,.9);font-size:.9rem;line-height:1.5}
@@ -235,10 +235,13 @@ const REVIEW_CSS = `
 .jm-pop button[type=submit],.jm-send{background:var(--magenta)!important;border-color:var(--magenta)!important;color:#fff!important}
 .jm-dock{position:fixed;right:1rem;bottom:1rem;z-index:12;max-width:calc(100vw - 2rem);padding:.5rem .5rem .5rem .75rem}
 .jm-hint{color:var(--text);white-space:nowrap}
-.jm-list{width:min(22rem,calc(100vw - 3.5rem));margin:0 0 .6rem;padding:0 0 0 1.2em;max-height:40vh;overflow:auto}
-.jm-list li{margin:.5rem 0;cursor:pointer}
+.jm-list,.jm-versions{width:min(22rem,calc(100vw - 3.5rem));margin:0 0 .6rem;padding:0 0 0 1.2em;max-height:40vh;overflow:auto}
+.jm-versions{list-style:none;padding:0}
+.jm-list li,.jm-versions li{margin:.5rem 0;cursor:pointer}
+.jm-versions li[aria-current]{color:var(--strong)}
 .jm-list q{color:var(--strong)}
 .jm-list .jm-del{float:right;padding:0 .5rem;border:none;color:var(--text)}
+.jm-viewing{margin:0 0 .6rem;color:var(--strong)}
 @media print{.jm-add,.jm-pop,.jm-dock{display:none!important}}
 `;
 
@@ -247,9 +250,10 @@ function reviewClient() {
   const art = document.querySelector("article");
   const comments = [];
   const ranges = new Map();
-  let seq = 0, pending = null, sent = false;
+  let seq = 0, pending = null, latest = 0, viewing = 0, followNext = false;
   const hl = window.Highlight && CSS.highlights ? new Highlight() : null;
   if (hl) CSS.highlights.set("justmd-comment", hl);
+  const post = (path, data) => fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
 
   const add = document.createElement("button");
   add.type = "button"; add.className = "jm-add"; add.hidden = true;
@@ -263,20 +267,22 @@ function reviewClient() {
     + '<div class="jm-row"><button type="button" data-act="cancel">Cancel</button><button type="submit">Save</button></div>';
   const dock = document.createElement("div");
   dock.className = "jm-dock";
-  dock.innerHTML = '<ol class="jm-list" hidden></ol><div class="jm-row"><button type="button" class="jm-count">0 comments</button><span class="jm-hint">Select text to comment</span><button type="button" class="jm-send">Send to AI</button></div>';
+  dock.innerHTML = '<ol class="jm-list" hidden></ol><ul class="jm-versions" hidden></ul>'
+    + '<div class="jm-viewing" hidden><span></span> <button type="button" data-act="restore">Restore this version</button> <button type="button" data-act="latest">Back to latest</button></div>'
+    + '<div class="jm-row"><button type="button" class="jm-count">0 comments</button><span class="jm-hint">Select text to comment</span>'
+    + '<button type="button" class="jm-ver" aria-label="Versions"></button><button type="button" class="jm-send">Send to AI</button></div>';
   document.body.append(add, pop, dock);
-  const list = dock.querySelector(".jm-list"), count = dock.querySelector(".jm-count"), hint = dock.querySelector(".jm-hint");
+  const $ = (s) => dock.querySelector(s);
+  const list = $(".jm-list"), versions = $(".jm-versions"), viewBar = $(".jm-viewing"), count = $(".jm-count"), hint = $(".jm-hint"), ver = $(".jm-ver");
   const fComment = pop.elements.comment, fReplace = pop.elements.replace;
+  const say = (text) => { hint.textContent = text; hint.hidden = false; };
 
+  // --- commenting ---
   const selected = () => {
     const s = getSelection();
-    if (sent || !s.rangeCount || s.isCollapsed || !s.toString().trim()) return null;
+    if (viewing !== latest || !s.rangeCount || s.isCollapsed || !s.toString().trim()) return null;
     const r = s.getRangeAt(0);
     return art.contains(r.commonAncestorContainer) ? r : null;
-  };
-  const placeBelow = (node, rect) => {
-    node.style.top = rect.bottom + scrollY + 8 + "px";
-    node.style.left = Math.max(12, Math.min(rect.left + scrollX, document.documentElement.clientWidth - node.offsetWidth - 12 + scrollX)) + "px";
   };
   // The icon sits just above the end of the selection, where the pointer let go.
   const showAdd = () => {
@@ -300,7 +306,9 @@ function reviewClient() {
     fReplace.value = quote;
     add.hidden = true;
     pop.hidden = false;
-    placeBelow(pop, r.getBoundingClientRect());
+    const rect = r.getBoundingClientRect();
+    pop.style.top = rect.bottom + scrollY + 8 + "px";
+    pop.style.left = Math.max(12, Math.min(rect.left, document.documentElement.clientWidth - pop.offsetWidth - 12)) + scrollX + "px";
     fComment.focus();
   });
   const close = () => { pop.hidden = true; pending = null; };
@@ -321,12 +329,12 @@ function reviewClient() {
     getSelection().removeAllRanges();
     close();
     render();
-    sync("comments");
   });
 
   const render = () => {
     count.textContent = comments.length + (comments.length === 1 ? " comment" : " comments");
-    hint.hidden = comments.length > 0;
+    if (comments.length) hint.hidden = true;
+    else list.hidden = true;
     list.replaceChildren(...comments.map((c) => {
       const li = document.createElement("li");
       const q = document.createElement("q");
@@ -337,86 +345,128 @@ function reviewClient() {
       del.addEventListener("click", (e) => {
         e.stopPropagation();
         comments.splice(comments.indexOf(c), 1);
-        if (hl) hl.delete(ranges.get(c.id));
+        if (hl && ranges.get(c.id)) hl.delete(ranges.get(c.id));
         ranges.delete(c.id);
         render();
-        sync("comments");
       });
       li.append(del, q, document.createElement("br"), c.replace ? "→ " + c.replace : "", c.replace && c.comment ? " · " : "", c.comment);
-      li.addEventListener("click", () => ranges.get(c.id).startContainer.parentElement.scrollIntoView({ block: "center", behavior: "smooth" }));
+      li.addEventListener("click", () => ranges.get(c.id)?.startContainer.parentElement.scrollIntoView({ block: "center", behavior: "smooth" }));
       return li;
     }));
   };
-  count.addEventListener("click", () => { list.hidden = !list.hidden || !comments.length; });
+  count.addEventListener("click", () => { list.hidden = !list.hidden || !comments.length; versions.hidden = true; });
 
-  const sync = (what) => fetch(what, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(comments) });
-  dock.querySelector(".jm-send").addEventListener("click", async (e) => {
+  $(".jm-send").addEventListener("click", async (e) => {
     e.target.disabled = true;
-    const res = await sync("done").catch(() => null);
-    if (!res || !res.ok) { e.target.disabled = false; hint.hidden = false; hint.textContent = "Could not reach justmd"; return; }
-    sent = true;
-    add.hidden = true; close();
-    dock.querySelector(".jm-row").replaceChildren("Sent " + count.textContent + ". You can close this tab.");
+    const res = await post("send", comments).catch(() => null);
+    e.target.disabled = false;
+    if (!res || !res.ok) { say("Could not reach justmd"); return; }
+    const n = comments.length;
+    comments.length = 0; ranges.clear(); if (hl) hl.clear();
+    render();
+    say(n ? `Sent ${n}. This page updates when the draft changes.` : "Sent: no changes requested.");
+  });
+
+  // --- live document and versions ---
+  // Re-anchor a comment after the document is replaced: find its quote again.
+  const find = (quote) => {
+    const walker = document.createTreeWalker(art, NodeFilter.SHOW_TEXT);
+    const nodes = []; let text = "";
+    for (let n; (n = walker.nextNode());) { nodes.push([n, text.length]); text += n.data; }
+    const at = text.indexOf(quote);
+    if (at < 0) return null;
+    const locate = (pos) => { let i = nodes.length - 1; while (i > 0 && nodes[i][1] > pos) i--; return [nodes[i][0], pos - nodes[i][1]]; };
+    const r = document.createRange();
+    r.setStart(...locate(at)); r.setEnd(...locate(at + quote.length));
+    return r;
+  };
+  const show = (doc) => {
+    viewing = doc.v;
+    close(); add.hidden = true;
+    art.innerHTML = doc.body;
+    document.title = doc.title;
+    document.querySelector("header h1").textContent = doc.title;
+    if (window.mermaid) mermaid.run({ nodes: art.querySelectorAll(".mermaid") });
+    if (hl) hl.clear();
+    for (const c of comments) {
+      const r = viewing === latest ? find(c.quote) : null;
+      ranges.set(c.id, r);
+      if (r && hl) hl.add(r);
+    }
+    viewBar.hidden = viewing === latest;
+    viewBar.querySelector("span").textContent = `Viewing v${viewing} (read-only)`;
+    ver.textContent = "v" + latest;
+  };
+  const load = async (v) => show(await (await fetch(v ? `doc?v=${v}` : "doc")).json());
+  ver.addEventListener("click", async () => {
+    list.hidden = true;
+    if (!versions.hidden) { versions.hidden = true; return; }
+    const all = await (await fetch("versions")).json();
+    versions.replaceChildren(...all.map((x) => {
+      const li = document.createElement("li");
+      li.textContent = `v${x.v} · ${new Date(x.at).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}${x.v === latest ? " (latest)" : ""}`;
+      if (x.v === viewing) li.setAttribute("aria-current", "true");
+      li.addEventListener("click", () => { versions.hidden = true; load(x.v); });
+      return li;
+    }));
+    versions.hidden = false;
+  });
+  viewBar.querySelector("[data-act=latest]").addEventListener("click", () => load());
+  viewBar.querySelector("[data-act=restore]").addEventListener("click", async () => {
+    followNext = true;
+    const res = await post("restore", { v: viewing }).catch(() => null);
+    if (!res || !res.ok) { followNext = false; say("Could not restore"); }
+  });
+  new EventSource("events").addEventListener("doc", async (e) => {
+    const was = latest;
+    latest = JSON.parse(e.data).v;
+    if (!was) { viewing = latest; ver.textContent = "v" + latest; return; }
+    if (viewing === was || followNext) { followNext = false; await load(); say(`Updated to v${latest}`); }
+    else ver.textContent = "v" + latest;
   });
 }
 
-
-const args = process.argv.slice(2);
-if (!args.length || args.includes("-h") || args.includes("--help")) {
-  console.error("usage: justmd <file.md> [-o out.html] [--open | --review]");
-  process.exit(args.length ? 0 : 1);
-}
-const doOpen = args.includes("--open");
-const doReview = args.includes("--review");
-const oIdx = args.indexOf("-o");
-const outPath = oIdx >= 0 ? args[oIdx + 1] : null;
-const input = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "-o");
-if (!input) { console.error("error: no input file"); process.exit(1); }
-
-const md = readFileSync(input, "utf8");
-
-// md4c/wasm GFM render — same parser family as md2html
-const body = await ready.then(() => parse(md, "github"));
-
-// --- post-process: mermaid blocks + table wrappers + title extraction ---
+// --- render ---
 function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function unesc(s) { return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&"); }
 
-let txt = body
-  .replace(/<pre><code class="language-mermaid">(.*?)<\/code><\/pre>/gs,
-    (_, code) => `<div class="mermaid">${unesc(code)}</div>`)
-  // highlight at render time: output carries the spans, no client JS, nothing fetched at view time
-  .replace(/<pre><code(?: class="language-([\w+#.-]+)")?>([\s\S]*?)<\/code><\/pre>/g, (m, lang, code) =>
-    lang && hljs.getLanguage(lang)
-      ? `<pre><code class="hljs language-${lang}">${hljs.highlight(unesc(code), { language: lang }).value}</code></pre>`
-      : m)
-  .replace(/<table>.*?<\/table>/gs, (m) => `<div class="tblwrap">${m}</div>`)
-  // Code blocks scroll like tables, so they get the same wrapper to hang the
-  // scroll affordance off (a ::after inside `white-space:pre` lands on the next
-  // line instead of the right edge).
-  .replace(/<pre>/g, '<div class="prewrap"><pre>')
-  .replace(/<\/pre>/g, "</pre></div>");
-
-const h1 = txt.match(/<h1>([\s\S]*?)<\/h1>/);
-// markdown-wasm injects heading anchors; md4c CLI doesn't — strip to plain text for the title
-const title = h1
-  ? h1[1].replace(/<a\b[^>]*>.*?<\/a>/gs, "").replace(/<[^>]+>/g, "").trim()
-  : input.replace(/\.md$/i, "");
-if (h1) txt = txt.slice(0, h1.index) + txt.slice(h1.index + h1[0].length);
+async function render(md, fallbackTitle) {
+  // md4c/wasm GFM render — same parser family as md2html
+  let txt = (await ready.then(() => parse(md, "github")))
+    .replace(/<pre><code class="language-mermaid">(.*?)<\/code><\/pre>/gs,
+      (_, code) => `<div class="mermaid">${unesc(code)}</div>`)
+    // highlight at render time: output carries the spans, no client JS, nothing fetched at view time
+    .replace(/<pre><code(?: class="language-([\w+#.-]+)")?>([\s\S]*?)<\/code><\/pre>/g, (m, lang, code) =>
+      lang && hljs.getLanguage(lang)
+        ? `<pre><code class="hljs language-${lang}">${hljs.highlight(unesc(code), { language: lang }).value}</code></pre>`
+        : m)
+    .replace(/<table>.*?<\/table>/gs, (m) => `<div class="tblwrap">${m}</div>`)
+    // Code blocks scroll like tables, so they get the same wrapper to hang the
+    // scroll affordance off (a ::after inside `white-space:pre` lands on the next
+    // line instead of the right edge).
+    .replace(/<pre>/g, '<div class="prewrap"><pre>')
+    .replace(/<\/pre>/g, "</pre></div>");
+  const h1 = txt.match(/<h1>([\s\S]*?)<\/h1>/);
+  // markdown-wasm injects heading anchors; md4c CLI doesn't — strip to plain text for the title
+  const title = unesc(h1 ? h1[1].replace(/<a\b[^>]*>.*?<\/a>/gs, "").replace(/<[^>]+>/g, "").trim() : fallbackTitle);
+  if (h1) txt = txt.slice(0, h1.index) + txt.slice(h1.index + h1[0].length);
+  return { title, body: txt };
+}
 
 // inline mermaid from node_modules — no network at view time
 const mermaidJs = readFileSync(join(dirname(require_.resolve("mermaid/package.json")), "dist", "mermaid.min.js"), "utf8")
   .replace(/<\/script/gi, "<\\/script");
 
-const html = TEMPLATE
-  .replaceAll("__TITLE__", esc(unesc(title)))
-  .replace("__FONTS__", () => FONTS)
-  .replace("__MERMAID__", () => mermaidJs)
-  .replace("__BODY__", () => txt);
-
-const out = resolve(outPath || input.replace(/\.(md|markdown)$/i, "") + ".html"); // absolute: openers treat relative paths as URLs
-writeFileSync(out, html);
-console.log(out);
+function page({ title, body }, review) {
+  const html = TEMPLATE
+    .replaceAll("__TITLE__", esc(title))
+    .replace("__FONTS__", () => FONTS)
+    .replace("__MERMAID__", () => mermaidJs)
+    .replace("__BODY__", () => body);
+  if (!review) return html;
+  const end = html.lastIndexOf("</body>");
+  return html.slice(0, end) + `<style>${REVIEW_CSS}</style>\n<script>(${reviewClient})()</script>\n` + html.slice(end);
+}
 
 function openWith(target) {
   const spec = process.platform === "darwin" ? ["open", [target]]
@@ -427,66 +477,176 @@ function openWith(target) {
   child.unref();
 }
 
-if (doOpen && !doReview) openWith(out);
+// --- CLI ---
+const args = process.argv.slice(2);
+if (!args.length || args.includes("-h") || args.includes("--help")) {
+  console.error("usage: justmd <file.md> [-o out.html] [--open | --review]");
+  process.exit(args.length ? 0 : 1);
+}
+const oIdx = args.indexOf("-o");
+const input = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "-o");
+if (!input) { console.error("error: no input file"); process.exit(1); }
+const src = resolve(input);
+const stem = basename(src).replace(/\.(md|markdown)$/i, "");
+const fallbackTitle = input.replace(/\.(md|markdown)$/i, "");
+const out = resolve(oIdx >= 0 ? args[oIdx + 1] : src.replace(/\.(md|markdown)$/i, "") + ".html"); // absolute: openers treat relative paths as URLs
+const commentsPath = join(dirname(out), stem + ".comments.md");
+// Review state lives beside the file: every version, and the running server's port.
+const stateDir = join(dirname(src), ".justmd", stem);
+const serverFile = join(stateDir, "server.json");
 
-if (doReview) {
-  const commentsPath = out.replace(/\.html$/i, "") + ".comments.md";
-  const end = html.lastIndexOf("</body>");
-  const page = html.slice(0, end) + `<style>${REVIEW_CSS}</style>\n<script>(${reviewClient})()</script>\n` + html.slice(end);
+if (args.includes("--serve")) await serve();
+else if (args.includes("--review")) await review();
+else {
+  writeFileSync(out, page(await render(readFileSync(src, "utf8"), fallbackTitle), false));
+  console.log(out);
+  if (args.includes("--open")) openWith(out);
+}
+
+// --review: make sure a review server runs for this file, open the page if no
+// tab is watching it, then block until the user presses Send to AI.
+async function review() {
+  const call = (port, method, path, timeout) => new Promise((ok, fail) => {
+    const req = httpRequest({ host: "127.0.0.1", port, method, path, headers: { "content-type": "application/json" }, timeout },
+      (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => (res.statusCode === 200 ? ok(JSON.parse(b)) : fail(new Error(`HTTP ${res.statusCode}`)))); });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", fail);
+    req.end(method === "POST" ? "{}" : undefined);
+  });
+  const ping = async () => {
+    try {
+      const { port } = JSON.parse(readFileSync(serverFile, "utf8"));
+      const info = await call(port, "GET", "/ping", 1000);
+      return info.file === src ? { port, ...info } : null;
+    } catch { return null; }
+  };
+  let info = await ping(), started = false;
+  if (!info) {
+    spawn(process.execPath, [fileURLToPath(import.meta.url), src, "-o", out, "--serve"], { detached: true, stdio: "ignore" }).unref();
+    for (let i = 0; i < 100 && !(info = await ping()); i++) await new Promise((r) => setTimeout(r, 100));
+    if (!info) { console.error("error: review server did not start"); process.exit(1); }
+    started = true;
+  }
+  const url = `http://127.0.0.1:${info.port}/`;
+  console.log(out);
+  console.log(`review: ${url}`);
+  console.log(`comments: ${commentsPath}`);
+  if (started || !info.clients) openWith(url);
+  const result = await call(info.port, "POST", "/wait", 0);
+  console.log(`done: ${result.count} comment(s) in ${commentsPath}`);
+  process.stdout.write(readFileSync(commentsPath, "utf8"));
+  process.exit(0);
+}
+
+// --serve (internal, started by --review): serve the page, push each new
+// version of the file to open tabs, and exit a minute after the last tab and
+// the last waiting --review are gone.
+async function serve() {
+  mkdirSync(stateDir, { recursive: true });
+  const vfile = (v) => join(stateDir, `v${String(v).padStart(3, "0")}.md`);
+  const listVersions = () => readdirSync(stateDir).filter((f) => /^v\d+\.md$/.test(f)).map((f) => Number(f.slice(1, -3))).sort((a, b) => a - b);
+  let md = null, latest = 0, doc = null;
+  const snapshot = async () => {
+    const next = readFileSync(src, "utf8");
+    if (next === md) return false;
+    md = next;
+    latest = listVersions().at(-1) || 0;
+    if (!latest || readFileSync(vfile(latest), "utf8") !== md) writeFileSync(vfile(++latest), md);
+    doc = { ...(await render(md, fallbackTitle)), v: latest };
+    writeFileSync(out, page(doc, false));
+    return true;
+  };
+  await snapshot();
 
   // Point each comment at its source line: compare with markdown syntax stripped.
   const plain = (s) => s.replace(/\]\([^)]*\)|[*_`~[\]]|<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-  const mdLines = md.split("\n").map(plain);
   const lineOf = (quote) => {
     const probe = plain(quote.split("\n").find((l) => l.trim()) || "").slice(0, 40);
-    return probe ? mdLines.findIndex((l) => l.includes(probe)) + 1 : 0;
+    return probe ? md.split("\n").map(plain).findIndex((l) => l.includes(probe)) + 1 : 0;
   };
   const quoted = (s) => s.split("\n").map((l) => `> ${l}`.trimEnd()).join("\n");
-  const printed = new Set();
-  const save = (list) => {
+  const saveComments = (list) => {
     const items = list.map((c, i) => {
       const line = lineOf(c.quote);
-      if (!printed.has(c.id)) {
-        printed.add(c.id);
-        console.log(`comment ${c.id}${line ? ` (line ${line})` : ""}: ${(c.comment || "replace text").slice(0, 80)}`);
-      }
       return [`## ${i + 1}${line ? ` · line ${line}` : ""}`, quoted(c.quote),
         c.replace && `**Replace with:**\n\n${quoted(c.replace)}`,
         c.comment && `**Comment:** ${c.comment}`].filter(Boolean).join("\n\n");
     });
-    writeFileSync(commentsPath, [`# Review comments: ${basename(input)}`, ...items].join("\n\n") + "\n");
+    const head = `# Review comments: ${basename(src)} v${latest}`;
+    writeFileSync(commentsPath, [head, ...(items.length ? items : ["No changes requested."])].join("\n\n") + "\n");
+  };
+
+  const tabs = new Set();
+  let waiters = [], unclaimed = null, lastSeen = Date.now(), debounce;
+  const broadcast = () => { for (const t of tabs) t.write(`event: doc\ndata: ${JSON.stringify({ v: latest })}\n\n`); };
+  // Watch the directory, not the file: editors replace files by rename.
+  watch(dirname(src), (_, name) => {
+    if (name !== basename(src)) return;
+    clearTimeout(debounce);
+    debounce = setTimeout(async () => { if (existsSync(src) && (await snapshot())) broadcast(); }, 150);
+  });
+  const json = (res, data) => res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(data));
+  const readJson = async (req) => {
+    let body = "";
+    for await (const chunk of req) { body += chunk; if (body.length > 1e6) throw new Error("too large"); }
+    return JSON.parse(body);
   };
 
   const server = createServer(async (req, res) => {
-    if (req.method === "GET" && req.url.split("?")[0] === "/") {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(page);
-    }
-    // A JSON content type forces a CORS preflight, which this server never
-    // answers, so other origins in the browser cannot post comments.
-    if (req.method !== "POST" || !["/comments", "/done"].includes(req.url) || req.headers["content-type"] !== "application/json") {
+    lastSeen = Date.now();
+    const url = new URL(req.url, "http://localhost");
+    if (req.method === "GET") {
+      if (url.pathname === "/") return res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(page(doc, true));
+      if (url.pathname === "/ping") return json(res, { file: src, clients: tabs.size });
+      if (url.pathname === "/doc") {
+        const v = Number(url.searchParams.get("v")) || latest;
+        if (v === latest) return json(res, doc);
+        if (!existsSync(vfile(v))) return res.writeHead(404).end();
+        return json(res, { ...(await render(readFileSync(vfile(v), "utf8"), fallbackTitle)), v });
+      }
+      if (url.pathname === "/versions") return json(res, listVersions().reverse().map((v) => ({ v, at: statSync(vfile(v)).mtimeMs })));
+      if (url.pathname === "/events") {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        res.write(`event: doc\ndata: ${JSON.stringify({ v: latest })}\n\n`);
+        tabs.add(res);
+        res.on("close", () => { tabs.delete(res); lastSeen = Date.now(); });
+        return;
+      }
       return res.writeHead(404).end();
     }
-    let body = "";
-    for await (const chunk of req) {
-      body += chunk;
-      if (body.length > 1e6) return res.writeHead(413).end();
+    // A JSON content type forces a CORS preflight, which this server never
+    // answers, so other origins in the browser cannot post here.
+    if (req.method !== "POST" || req.headers["content-type"] !== "application/json") return res.writeHead(404).end();
+    let data;
+    try { data = await readJson(req); } catch { return res.writeHead(400).end(); }
+    if (url.pathname === "/send" && Array.isArray(data)) {
+      saveComments(data.map((c) => ({ quote: String(c.quote ?? ""), comment: String(c.comment ?? ""), replace: String(c.replace ?? "") })));
+      const result = { count: data.length };
+      if (waiters.length) { for (const w of waiters) json(w, result); waiters = []; } else unclaimed = result;
+      return res.writeHead(204).end();
     }
-    let list;
-    try { list = JSON.parse(body); } catch { return res.writeHead(400).end(); }
-    if (!Array.isArray(list)) return res.writeHead(400).end();
-    save(list.map((c) => ({ id: Number(c.id) || 0, quote: String(c.quote ?? ""), comment: String(c.comment ?? ""), replace: String(c.replace ?? "") })));
-    if (req.url === "/done") {
-      res.on("finish", () => { console.log(`done: ${list.length} comment(s) in ${commentsPath}`); process.exit(0); });
+    if (url.pathname === "/restore" && existsSync(vfile(Number(data.v)))) {
+      writeFileSync(src, readFileSync(vfile(Number(data.v)), "utf8")); // the watcher turns this into a new version
+      return res.writeHead(204).end();
     }
-    res.writeHead(204).end();
+    if (url.pathname === "/wait") {
+      if (unclaimed) { json(res, unclaimed); unclaimed = null; return; }
+      waiters.push(res);
+      res.on("close", () => { waiters = waiters.filter((w) => w !== res); lastSeen = Date.now(); });
+      return;
+    }
+    return res.writeHead(404).end();
   });
-  server.listen(0, "127.0.0.1", () => {
-    const url = `http://127.0.0.1:${server.address().port}/`;
-    console.log(`review: ${url}`);
-    console.log(`comments: ${commentsPath}`);
-    openWith(url);
+  // Heartbeats keep idle SSE sockets open; the same tick handles idle exit.
+  setInterval(() => {
+    for (const t of tabs) t.write(": ping\n\n");
+    if (!tabs.size && !waiters.length && Date.now() - lastSeen > 60_000) process.exit(0);
+  }, 15_000);
+  process.on("exit", () => {
+    try { if (JSON.parse(readFileSync(serverFile, "utf8")).pid === process.pid) unlinkSync(serverFile); } catch {}
   });
+  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
+  server.listen(0, "127.0.0.1", () => writeFileSync(serverFile, JSON.stringify({ port: server.address().port, pid: process.pid })));
 }
 
 // --- chrome: xmit.dev-derived theme; tables/scrollbars in the same idiom ---

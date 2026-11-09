@@ -32,16 +32,25 @@ their comments back. Run it as a background job and wait for it to exit:
 
 ```sh
 npx justmd draft.md --review
-# stdout: <abs>/draft.html, then "review: http://127.0.0.1:<port>/",
-# "comments: <abs>/draft.comments.md", one "comment N (line L): …" per new
-# comment, and "done: N comment(s) in …" when the user presses Send to AI.
+# stdout: <abs>/draft.html, "review: http://127.0.0.1:<port>/",
+# "comments: <abs>/draft.comments.md"; when the user presses Send to AI:
+# "done: N comment(s) in …" followed by the comments file itself.
 ```
 
-Exit 0 means the user sent. Then read `draft.comments.md`: one `## N · line L`
-section per comment with the quoted passage, an optional `**Replace with:**`
-block (the text the user wants instead) and an optional `**Comment:**`. Apply
-them to `draft.md`; the line number is a best-effort pointer, the quote is
-authoritative. The server binds to 127.0.0.1 only and exits on Send.
+Exit 0 means the user sent. The comments (also in `draft.comments.md`) are one
+`## N · line L` section per comment with the quoted passage, an optional
+`**Replace with:**` block (the text the user wants instead) and an optional
+`**Comment:**`; zero comments reads "No changes requested". Apply them to
+`draft.md`; the line number is a best-effort pointer, the quote is
+authoritative.
+
+Rounds: after editing `draft.md`, run `--review` again. The open tab updates in
+place by itself (it watches the file), the second run reuses the running
+server and opens no new tab, and it again blocks until the next Send. Every
+version of the file is kept in `.justmd/draft/vNNN.md` beside it; the user can
+view and restore old versions from the page, and a restore is just another file
+change, so read `draft.md` fresh before each edit. Add `.justmd/` to
+`.gitignore` in repos.
 
 ## Print → PDF
 
@@ -67,7 +76,7 @@ legibility. Not by file size or page count alone.
   and it renders identically.
 - Prints the absolute output path on stdout; errors on stderr with non-zero exit.
 - Reads only the input file; writes only the output file (and, with `--review`,
-  `<file>.comments.md`). Safe for untrusted trees.
+  `<file>.comments.md` and the `.justmd/` version folder). Safe for untrusted trees.
 
 ## Notes for agents
 
