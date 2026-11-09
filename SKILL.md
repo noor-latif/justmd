@@ -7,7 +7,8 @@ mermaid diagrams, syntax-friendly theme. No network needed at view time.
 
 Use when the user wants to **read or check** a `.md` file where terminal rendering
 falls short: tables with prose cells, mermaid/flowchart blocks, long structured
-documents. Do not use for editing.
+documents. Use `--review` when the user should comment on a draft; never edit
+the markdown through the browser yourself.
 
 **Also the markdown → PDF path for this workspace** (no pandoc/wkhtmltopdf
 installed). When a deliverable must be a PDF — a recipient that rejects `.md`
@@ -21,7 +22,26 @@ that silently drifts from the source.
 npx justmd <file.md>              # write <file>.html, print its path
 npx justmd <file.md> -o out.html  # choose output path
 npx justmd <file.md> --open       # also launch in the default browser
+npx justmd <file.md> --review     # let the user comment in the browser
 ```
+
+## Review: collect the user's comments
+
+Use when the user should review a draft (a letter, a post, a plan) and you need
+their comments back. Run it as a background job and wait for it to exit:
+
+```sh
+npx justmd draft.md --review
+# stdout: <abs>/draft.html, then "review: http://127.0.0.1:<port>/",
+# "comments: <abs>/draft.comments.md", one "comment N (line L): …" per new
+# comment, and "done: N comment(s) in …" when the user presses Send to AI.
+```
+
+Exit 0 means the user sent. Then read `draft.comments.md`: one `## N · line L`
+section per comment with the quoted passage, an optional `**Replace with:**`
+block (the text the user wants instead) and an optional `**Comment:**`. Apply
+them to `draft.md`; the line number is a best-effort pointer, the quote is
+authoritative. The server binds to 127.0.0.1 only and exits on Send.
 
 ## Print → PDF
 
@@ -46,7 +66,8 @@ legibility. Not by file size or page count alone.
   ~3.5 MB overhead). Send it anywhere — phone, chat attachment, air-gapped machine —
   and it renders identically.
 - Prints the absolute output path on stdout; errors on stderr with non-zero exit.
-- Reads only the input file; writes only the output file. Safe for untrusted trees.
+- Reads only the input file; writes only the output file (and, with `--review`,
+  `<file>.comments.md`). Safe for untrusted trees.
 
 ## Notes for agents
 

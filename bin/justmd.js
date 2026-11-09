@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // justmd — render markdown to a self-contained HTML file (GFM tables, mermaid diagrams).
-// Usage: justmd <file.md> [-o out.html] [--open]
+// Usage: justmd <file.md> [-o out.html] [--open | --review]
 //   Default: writes <file>.html next to the input; prints the path.
 //   --open   also opens the result with the platform opener (xdg-open/open/start).
+//   --review serves the page on 127.0.0.1 with select-to-comment; comments are
+//            written to <file>.comments.md and the process exits on "Send to AI".
 import { ready, parse } from "markdown-wasm";
 import hljs from "highlight.js/lib/common";
 import { createRequire } from "node:module";
 import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
@@ -213,13 +216,158 @@ __BODY__
 </html>
 `;
 
+// Review mode UI. Injected only into the page served by --review, never into
+// the written .html, so the static output stays script-free apart from mermaid.
+const REVIEW_CSS = `
+::highlight(justmd-comment){background:rgba(233,127,192,.3);color:#fff}
+.jm-add,.jm-pop{position:absolute;z-index:10}
+.jm-add[hidden],.jm-pop[hidden],.jm-list[hidden]{display:none!important}
+.jm-add{display:grid;place-items:center;width:2.25rem;height:2.25rem;padding:0;border-radius:50%;border:1px solid var(--border);background:#2A2136;color:var(--link);cursor:pointer;box-shadow:0 .5rem 1.5rem -.5rem rgba(0,0,0,.8)}
+.jm-add:hover{color:#fff;background:var(--magenta)}
+.jm-pop,.jm-dock{background:#221F2E;border:1px solid var(--border);border-radius:.75rem;box-shadow:0 1rem 3rem -1rem rgba(0,0,0,.9);font-size:.9rem;line-height:1.5}
+.jm-pop{width:min(26rem,calc(100vw - 1.5rem));padding:1rem;display:grid;gap:.75rem}
+.jm-pop label{display:grid;gap:.3rem;color:var(--strong)}
+.jm-pop small{color:var(--text)}
+.jm-pop textarea{font:inherit;color:#fff;background:rgba(0,0,0,.3);border:1px solid var(--border);border-radius:.5rem;padding:.5rem .6rem;resize:vertical}
+.jm-quote{margin:0;max-height:6em;overflow:auto;font-size:.85rem}
+.jm-row{display:flex;gap:.5rem;justify-content:flex-end;align-items:center}
+.jm-pop button,.jm-dock button{font:inherit;font-size:.85rem;white-space:nowrap;border-radius:999px;padding:.4rem .9rem;border:1px solid var(--border);background:transparent;color:var(--strong);cursor:pointer}
+.jm-pop button[type=submit],.jm-send{background:var(--magenta)!important;border-color:var(--magenta)!important;color:#fff!important}
+.jm-dock{position:fixed;right:1rem;bottom:1rem;z-index:12;max-width:calc(100vw - 2rem);padding:.5rem .5rem .5rem .75rem}
+.jm-hint{color:var(--text);white-space:nowrap}
+.jm-list{width:min(22rem,calc(100vw - 3.5rem));margin:0 0 .6rem;padding:0 0 0 1.2em;max-height:40vh;overflow:auto}
+.jm-list li{margin:.5rem 0;cursor:pointer}
+.jm-list q{color:var(--strong)}
+.jm-list .jm-del{float:right;padding:0 .5rem;border:none;color:var(--text)}
+@media print{.jm-add,.jm-pop,.jm-dock{display:none!important}}
+`;
+
+// Runs in the browser (stringified below), so it may only use DOM APIs.
+function reviewClient() {
+  const art = document.querySelector("article");
+  const comments = [];
+  const ranges = new Map();
+  let seq = 0, pending = null, sent = false;
+  const hl = window.Highlight && CSS.highlights ? new Highlight() : null;
+  if (hl) CSS.highlights.set("justmd-comment", hl);
+
+  const add = document.createElement("button");
+  add.type = "button"; add.className = "jm-add"; add.hidden = true;
+  add.setAttribute("aria-label", "Comment on selection");
+  add.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-5 4v-4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/></svg>';
+  const pop = document.createElement("form");
+  pop.className = "jm-pop"; pop.hidden = true;
+  pop.innerHTML = '<blockquote class="jm-quote"></blockquote>'
+    + '<label>Comment<textarea name="comment" rows="3"></textarea></label>'
+    + '<label>Replace with <small>edit to suggest new text</small><textarea name="replace" rows="3"></textarea></label>'
+    + '<div class="jm-row"><button type="button" data-act="cancel">Cancel</button><button type="submit">Save</button></div>';
+  const dock = document.createElement("div");
+  dock.className = "jm-dock";
+  dock.innerHTML = '<ol class="jm-list" hidden></ol><div class="jm-row"><button type="button" class="jm-count">0 comments</button><span class="jm-hint">Select text to comment</span><button type="button" class="jm-send">Send to AI</button></div>';
+  document.body.append(add, pop, dock);
+  const list = dock.querySelector(".jm-list"), count = dock.querySelector(".jm-count"), hint = dock.querySelector(".jm-hint");
+  const fComment = pop.elements.comment, fReplace = pop.elements.replace;
+
+  const selected = () => {
+    const s = getSelection();
+    if (sent || !s.rangeCount || s.isCollapsed || !s.toString().trim()) return null;
+    const r = s.getRangeAt(0);
+    return art.contains(r.commonAncestorContainer) ? r : null;
+  };
+  const placeBelow = (node, rect) => {
+    node.style.top = rect.bottom + scrollY + 8 + "px";
+    node.style.left = Math.max(12, Math.min(rect.left + scrollX, document.documentElement.clientWidth - node.offsetWidth - 12 + scrollX)) + "px";
+  };
+  // The icon sits just above the end of the selection, where the pointer let go.
+  const showAdd = () => {
+    const r = selected();
+    if (!r || !pop.hidden) { add.hidden = true; return; }
+    const rects = r.getClientRects(), end = rects[rects.length - 1] || r.getBoundingClientRect();
+    add.hidden = false;
+    add.style.top = end.top + scrollY - add.offsetHeight - 6 + "px";
+    add.style.left = Math.min(end.right + scrollX - add.offsetWidth / 2, document.documentElement.clientWidth + scrollX - add.offsetWidth - 8) + "px";
+  };
+  document.addEventListener("pointerup", (e) => { if (!add.contains(e.target) && !pop.contains(e.target)) setTimeout(showAdd); });
+  document.addEventListener("keyup", (e) => { if (e.shiftKey || e.key === "Shift") showAdd(); });
+  add.addEventListener("pointerdown", (e) => e.preventDefault()); // keep the selection alive
+  add.addEventListener("click", () => {
+    const r = selected();
+    if (!r) return;
+    pending = r.cloneRange();
+    const quote = r.toString();
+    pop.querySelector(".jm-quote").textContent = quote;
+    fComment.value = "";
+    fReplace.value = quote;
+    add.hidden = true;
+    pop.hidden = false;
+    placeBelow(pop, r.getBoundingClientRect());
+    fComment.focus();
+  });
+  const close = () => { pop.hidden = true; pending = null; };
+  pop.querySelector("[data-act=cancel]").addEventListener("click", close);
+  pop.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) pop.requestSubmit();
+  });
+  pop.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const quote = pending.toString(), comment = fComment.value.trim(), replace = fReplace.value;
+    const changed = replace !== quote;
+    if (!comment && !changed) { fComment.focus(); return; }
+    const c = { id: ++seq, quote, comment, replace: changed ? replace : "" };
+    comments.push(c);
+    ranges.set(c.id, pending);
+    if (hl) hl.add(pending);
+    getSelection().removeAllRanges();
+    close();
+    render();
+    sync("comments");
+  });
+
+  const render = () => {
+    count.textContent = comments.length + (comments.length === 1 ? " comment" : " comments");
+    hint.hidden = comments.length > 0;
+    list.replaceChildren(...comments.map((c) => {
+      const li = document.createElement("li");
+      const q = document.createElement("q");
+      q.textContent = c.quote.length > 80 ? c.quote.slice(0, 80) + "…" : c.quote;
+      const del = document.createElement("button");
+      del.type = "button"; del.className = "jm-del"; del.textContent = "×";
+      del.setAttribute("aria-label", "Delete comment");
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        comments.splice(comments.indexOf(c), 1);
+        if (hl) hl.delete(ranges.get(c.id));
+        ranges.delete(c.id);
+        render();
+        sync("comments");
+      });
+      li.append(del, q, document.createElement("br"), c.replace ? "→ " + c.replace : "", c.replace && c.comment ? " · " : "", c.comment);
+      li.addEventListener("click", () => ranges.get(c.id).startContainer.parentElement.scrollIntoView({ block: "center", behavior: "smooth" }));
+      return li;
+    }));
+  };
+  count.addEventListener("click", () => { list.hidden = !list.hidden || !comments.length; });
+
+  const sync = (what) => fetch(what, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(comments) });
+  dock.querySelector(".jm-send").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    const res = await sync("done").catch(() => null);
+    if (!res || !res.ok) { e.target.disabled = false; hint.hidden = false; hint.textContent = "Could not reach justmd"; return; }
+    sent = true;
+    add.hidden = true; close();
+    dock.querySelector(".jm-row").replaceChildren("Sent " + count.textContent + ". You can close this tab.");
+  });
+}
+
 
 const args = process.argv.slice(2);
 if (!args.length || args.includes("-h") || args.includes("--help")) {
-  console.error("usage: justmd <file.md> [-o out.html] [--open]");
+  console.error("usage: justmd <file.md> [-o out.html] [--open | --review]");
   process.exit(args.length ? 0 : 1);
 }
 const doOpen = args.includes("--open");
+const doReview = args.includes("--review");
 const oIdx = args.indexOf("-o");
 const outPath = oIdx >= 0 ? args[oIdx + 1] : null;
 const input = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "-o");
@@ -270,13 +418,75 @@ const out = resolve(outPath || input.replace(/\.(md|markdown)$/i, "") + ".html")
 writeFileSync(out, html);
 console.log(out);
 
-if (doOpen) {
-  const spec = process.platform === "darwin" ? ["open", [out]]
-    : process.platform === "win32" ? ["cmd", ["/c", "start", "", out]]
-    : ["xdg-open", [out]];
+function openWith(target) {
+  const spec = process.platform === "darwin" ? ["open", [target]]
+    : process.platform === "win32" ? ["cmd", ["/c", "start", "", target]]
+    : ["xdg-open", [target]];
   const child = spawn(spec[0], spec[1], { stdio: "ignore", detached: true });
-  child.on("error", () => console.error(`note: could not run ${spec[0]}; open ${out} manually`));
+  child.on("error", () => console.error(`note: could not run ${spec[0]}; open ${target} manually`));
   child.unref();
+}
+
+if (doOpen && !doReview) openWith(out);
+
+if (doReview) {
+  const commentsPath = out.replace(/\.html$/i, "") + ".comments.md";
+  const end = html.lastIndexOf("</body>");
+  const page = html.slice(0, end) + `<style>${REVIEW_CSS}</style>\n<script>(${reviewClient})()</script>\n` + html.slice(end);
+
+  // Point each comment at its source line: compare with markdown syntax stripped.
+  const plain = (s) => s.replace(/\]\([^)]*\)|[*_`~[\]]|<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  const mdLines = md.split("\n").map(plain);
+  const lineOf = (quote) => {
+    const probe = plain(quote.split("\n").find((l) => l.trim()) || "").slice(0, 40);
+    return probe ? mdLines.findIndex((l) => l.includes(probe)) + 1 : 0;
+  };
+  const quoted = (s) => s.split("\n").map((l) => `> ${l}`.trimEnd()).join("\n");
+  const printed = new Set();
+  const save = (list) => {
+    const items = list.map((c, i) => {
+      const line = lineOf(c.quote);
+      if (!printed.has(c.id)) {
+        printed.add(c.id);
+        console.log(`comment ${c.id}${line ? ` (line ${line})` : ""}: ${(c.comment || "replace text").slice(0, 80)}`);
+      }
+      return [`## ${i + 1}${line ? ` · line ${line}` : ""}`, quoted(c.quote),
+        c.replace && `**Replace with:**\n\n${quoted(c.replace)}`,
+        c.comment && `**Comment:** ${c.comment}`].filter(Boolean).join("\n\n");
+    });
+    writeFileSync(commentsPath, [`# Review comments: ${basename(input)}`, ...items].join("\n\n") + "\n");
+  };
+
+  const server = createServer(async (req, res) => {
+    if (req.method === "GET" && req.url.split("?")[0] === "/") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      return res.end(page);
+    }
+    // A JSON content type forces a CORS preflight, which this server never
+    // answers, so other origins in the browser cannot post comments.
+    if (req.method !== "POST" || !["/comments", "/done"].includes(req.url) || req.headers["content-type"] !== "application/json") {
+      return res.writeHead(404).end();
+    }
+    let body = "";
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 1e6) return res.writeHead(413).end();
+    }
+    let list;
+    try { list = JSON.parse(body); } catch { return res.writeHead(400).end(); }
+    if (!Array.isArray(list)) return res.writeHead(400).end();
+    save(list.map((c) => ({ id: Number(c.id) || 0, quote: String(c.quote ?? ""), comment: String(c.comment ?? ""), replace: String(c.replace ?? "") })));
+    if (req.url === "/done") {
+      res.on("finish", () => { console.log(`done: ${list.length} comment(s) in ${commentsPath}`); process.exit(0); });
+    }
+    res.writeHead(204).end();
+  });
+  server.listen(0, "127.0.0.1", () => {
+    const url = `http://127.0.0.1:${server.address().port}/`;
+    console.log(`review: ${url}`);
+    console.log(`comments: ${commentsPath}`);
+    openWith(url);
+  });
 }
 
 // --- chrome: xmit.dev-derived theme; tables/scrollbars in the same idiom ---
