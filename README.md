@@ -4,12 +4,15 @@ Render markdown to a **self-contained HTML file** — GitHub-flavored tables, me
 diagrams, syntax-highlighted code, one opinionated dark theme. No network needed at
 view time; the output travels anywhere (phone, chat attachment, air-gapped machine).
 
+![A rendered page: title, intro paragraph and a GFM table](docs/page.webp)
+
 ## Usage
 
 ```sh
 npx justmd <file.md>              # write <file>.html, print its path
 npx justmd <file.md> -o out.html  # choose output path
 npx justmd <file.md> --open       # also open in the default browser
+npx justmd <file.md> --review     # open with select-to-comment, comments go back to file
 ```
 
 ## Why
@@ -25,7 +28,28 @@ family the big renderers use.
 - **GFM tables** with prose-friendly cells (horizontal scroll instead of squeeze).
 - **Mermaid diagrams** render client-side, full-size (`useMaxWidth: false`).
 - **Agent-friendly**: deterministic absolute output path on stdout, no side
-  effects beyond the output file. See [SKILL.md](SKILL.md) for the agent contract.
+  effects beyond the output file (plus the comments file in review mode). See
+  [SKILL.md](SKILL.md) for the agent contract.
+
+<p>
+<img src="docs/diagram.webp" alt="A mermaid flowchart and a code block" width="62%">
+<img src="docs/phone.webp" alt="The same page on a phone" width="30%">
+</p>
+
+## Review mode
+
+`--review` is for reviewing a draft with an AI agent without switching windows.
+It serves the page on `127.0.0.1` and opens it. Select any text and a comment
+button appears: write a comment, edit the text into what you want instead, or
+both. Commented passages stay highlighted, and the list sits in the corner.
+
+![Review mode: a highlighted passage, the comment form and the comment dock](docs/review.webp)
+
+Every save is written to `<file>.comments.md` next to the input, with the quoted
+passage, its source line, and your comment or replacement text. **Send to AI**
+writes the final list and exits the process, so an agent that started
+`justmd --review` and waits on it gets your comments the moment you press it.
+The written `.html` file never contains the review UI.
 
 ## Desktop integration (Linux)
 

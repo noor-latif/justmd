@@ -3,6 +3,10 @@
   "version": "0.3.0-alpha.3",
   "description": "Render markdown to a self-contained HTML file — GFM tables, mermaid diagrams, one opinionated theme. npx justmd file.md",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/noor-latif/justmd.git"
+  },
   "type": "module",
   "bin": {
     "justmd": "bin/justmd.js"
